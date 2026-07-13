@@ -71,8 +71,8 @@ Same — clone the repo, copy the plugin file into your project's `.opencode\plu
 ### Verify
 
 1. Restart opencode
-2. Send any message (e.g., `hi`)
-3. The LLM will call `load_tool()` before using any tool
+2. Send any message (e.g., `hi`) and see the difference in opencode token counter.
+3. For request with tool calling, the LLM will call `load_tool()` before using any tool
 
 ### Uninstall
 
