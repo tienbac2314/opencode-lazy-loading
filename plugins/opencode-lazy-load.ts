@@ -116,6 +116,89 @@ function isParsableJson(str: string): boolean {
   try { JSON.parse(str); return true } catch { return false }
 }
 
+type KnownTool = { name: string; kind: "built-in" | "mcp" }
+
+function resolveKnownTool(name: string): KnownTool | undefined {
+  if (originals.has(name)) return { name, kind: "built-in" }
+  if (mcpOriginals.has(name)) return { name, kind: "mcp" }
+
+  const lowerName = name.toLowerCase()
+  const foldedNames = new Set([
+    ...Array.from(originals.keys()).filter((knownName) => knownName.toLowerCase() === lowerName),
+    ...Array.from(mcpOriginals.keys()).filter((knownName) => knownName.toLowerCase() === lowerName),
+  ])
+  if (foldedNames.size !== 1) return undefined
+
+  const [resolvedName] = foldedNames
+  if (originals.has(resolvedName)) return { name: resolvedName, kind: "built-in" }
+  if (mcpOriginals.has(resolvedName)) return { name: resolvedName, kind: "mcp" }
+  return undefined
+}
+
+function normalizeSchemaValue(value: any, schema: any): any {
+  const types = Array.isArray(schema?.type)
+    ? schema.type.filter((type: unknown) => type !== "null")
+    : [schema?.type]
+  if (types.length !== 1) return value
+
+  switch (types[0]) {
+    case "number":
+    case "integer": {
+      if (typeof value !== "string" || value.trim() === "") return value
+      const number = Number(value)
+      if (!Number.isFinite(number)) return value
+      if (types[0] === "integer" && !Number.isSafeInteger(number)) return value
+      return number
+    }
+    case "boolean":
+      if (value === "true") return true
+      if (value === "false") return false
+      return value
+    case "array": {
+      let array = value
+      if (typeof array === "string") {
+        try {
+          const parsed = JSON.parse(array)
+          if (!Array.isArray(parsed)) return value
+          array = parsed
+        } catch {
+          return value
+        }
+      }
+      if (!Array.isArray(array) || !schema.items) return array
+      return array.map((item: any) => normalizeSchemaValue(item, schema.items))
+    }
+    case "object": {
+      let object = value
+      if (typeof object === "string") {
+        try {
+          const parsed = JSON.parse(object)
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return value
+          object = parsed
+        } catch {
+          return value
+        }
+      }
+      if (!object || typeof object !== "object" || Array.isArray(object)) return object
+      if (!schema.properties || typeof schema.properties !== "object") return object
+      const normalized = { ...object }
+      for (const [property, propertySchema] of Object.entries(schema.properties)) {
+        if (Object.prototype.hasOwnProperty.call(normalized, property)) {
+          normalized[property] = normalizeSchemaValue(normalized[property], propertySchema)
+        }
+      }
+      return normalized
+    }
+    default:
+      return value
+  }
+}
+
+function normalizeToolArguments(argumentsJson: string, schema: any): string {
+  if (!schema || !isParsableJson(argumentsJson)) return argumentsJson
+  return JSON.stringify(normalizeSchemaValue(JSON.parse(argumentsJson), schema))
+}
+
 // ─── Fetch wrapper (request + response interception) ─────────────────────────
 //
 // REQUEST side: Remove ALL tools except load_tool from body.tools. The LLM
@@ -208,9 +291,11 @@ function wrapFetch(): void {
                 continue
               }
               const desc = fn?.description || t?.description || ""
-              const params = fn?.parameters || t?.parameters || {}
-              if (desc && !mcpOriginals.has(name)) {
+              const params = fn?.parameters || t?.parameters
+              if (!mcpOriginals.has(name)) {
                 mcpOriginals.set(name, desc)
+              }
+              if (params && !mcpSchemas.has(name)) {
                 mcpSchemas.set(name, params)
               }
             }
@@ -424,7 +509,8 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
                 if (isLoadToolName(name)) {
                   // load_tool passes through. Track the loaded tool in this
                   // stream so subsequent direct calls within the SAME turn work.
-                  const loadName = callArgs.name
+                  const requestedName = typeof callArgs?.name === "string" ? callArgs.name : ""
+                  const loadName = resolveKnownTool(requestedName)?.name || requestedName
                   if (loadName) getTurnLoaded().add(loadName)
                   filtered.push({
                     index: idx,
@@ -432,7 +518,9 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
                     type: "function",
                     function: {
                       name: loadToolName,
-                      arguments: buf.arguments,
+                      arguments: loadName !== requestedName
+                        ? JSON.stringify({ ...callArgs, name: loadName })
+                        : buf.arguments,
                     },
                   })
                 } else {
@@ -441,17 +529,19 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
                   // Otherwise rewrite to load_tool. turnLoaded persists across
                   // fetches within the same turn (multi-step tool use) and is
                   // cleared when finish_reason "stop" is seen.
-                  // MCP tools (no entry in originals) pass through untouched.
-                  if (originals.has(name)) {
-                    if (getTurnLoaded().has(name)) {
+                  // MCP tools (no entry in originals) remain direct calls.
+                  const knownTool = resolveKnownTool(name)
+                  if (knownTool?.kind === "built-in") {
+                    const originalName = knownTool.name
+                    if (getTurnLoaded().has(originalName)) {
                       // Already loaded in this turn — allow direct call
                       filtered.push({
                         index: idx,
                         id: buf.id,
                         type: "function",
                         function: {
-                          name,
-                          arguments: buf.arguments,
+                          name: originalName,
+                          arguments: normalizeToolArguments(buf.arguments, originalSchemas.get(originalName)),
                         },
                       })
                     } else {
@@ -459,26 +549,30 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
                       // ALSO add to turnLoaded now, because the load_tool will
                       // execute and return the tool's instructions. The LLM's
                       // next call to this tool should be allowed directly.
-                      getTurnLoaded().add(name)
+                      getTurnLoaded().add(originalName)
                       filtered.push({
                         index: idx,
                         id: buf.id,
                         type: "function",
                         function: {
                           name: loadToolName,
-                          arguments: JSON.stringify({ name }),
+                          arguments: JSON.stringify({ name: originalName }),
                         },
                       })
                     }
                   } else {
-                    // MCP tool — pass through as-is
+                    // Known MCP tools pass through directly with their own schema.
+                    // Unknown tools remain byte-for-byte unchanged.
+                    const mcpName = knownTool?.kind === "mcp" ? knownTool.name : undefined
                     filtered.push({
                       index: idx,
                       id: buf.id,
                       type: "function",
                       function: {
-                        name,
-                        arguments: buf.arguments,
+                        name: mcpName || name,
+                        arguments: mcpName
+                          ? normalizeToolArguments(buf.arguments, mcpSchemas.get(mcpName))
+                          : buf.arguments,
                       },
                     })
                   }
