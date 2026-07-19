@@ -55,16 +55,20 @@ function toolNames(output: string): string[] {
 }
 
 async function runRequest(sessionID: string, tools: NativeTool[], upstreamSSE: string) {
-  upstreamBySession.set(sessionID, upstreamSSE)
-  const response = await globalThis.fetch("https://example.test/chat/completions", {
-    method: "POST",
-    headers: { "x-opencode-session": sessionID },
-    body: JSON.stringify({ tools }),
-  })
+  const response = await startRequest(sessionID, tools, upstreamSSE)
   const output = await response.text()
   const providerRequest = requests.at(-1)?.body
   if (!providerRequest) throw new Error("Provider request was not captured")
   return { providerRequest, output }
+}
+
+async function startRequest(sessionID: string, tools: NativeTool[], upstreamSSE: string) {
+  upstreamBySession.set(sessionID, upstreamSSE)
+  return globalThis.fetch("https://example.test/chat/completions", {
+    method: "POST",
+    headers: { "x-opencode-session": sessionID },
+    body: JSON.stringify({ tools }),
+  })
 }
 
 mock.module("@opencode-ai/plugin", () => ({
@@ -102,6 +106,11 @@ const loadTool: NativeTool = {
   function: { name: "load_tool", description: "Gateway", parameters: {} },
 }
 
+const namespacedLoadTool: NativeTool = {
+  type: "function",
+  function: { name: "opencode-lazy-load_load_tool", description: "Gateway", parameters: {} },
+}
+
 const readTool: NativeTool = {
   type: "function",
   function: {
@@ -129,6 +138,36 @@ test("keeps only load_tool in provider request and preserves a plain gateway cal
 
   expect(providerRequest.tools?.map((tool) => tool.function.name)).toEqual(["load_tool"])
   expect(toolNames(output)).toEqual(["load_tool"])
+})
+
+test("keeps only a namespaced gateway in provider request and preserves its response name", async () => {
+  const { providerRequest, output } = await runRequest(
+    "namespaced-gateway",
+    [namespacedLoadTool, readTool],
+    sseTool("opencode-lazy-load_load_tool", { name: "read" }) + finish() + "data: [DONE]\n\n",
+  )
+
+  expect(providerRequest.tools?.map((tool) => tool.function.name)).toEqual(["opencode-lazy-load_load_tool"])
+  expect(toolNames(output)).toEqual(["opencode-lazy-load_load_tool"])
+})
+
+test("keeps interleaved gateway aliases isolated per response", async () => {
+  const responseA = await startRequest(
+    "plain-interleaved",
+    [loadTool, readTool],
+    sseTool("read", { path: "/plain" }) + finish("tool_calls") + "data: [DONE]\n\n",
+  )
+  const responseB = await startRequest(
+    "namespaced-interleaved",
+    [namespacedLoadTool, readTool],
+    sseTool("read", { path: "/namespaced" }) + finish("tool_calls") + "data: [DONE]\n\n",
+  )
+
+  const outputA = await responseA.text()
+  const outputB = await responseB.text()
+
+  expect(toolNames(outputA)).toEqual(["load_tool"])
+  expect(toolNames(outputB)).toEqual(["opencode-lazy-load_load_tool"])
 })
 
 test("passes a request-captured MCP tool through directly", async () => {

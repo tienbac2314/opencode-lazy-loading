@@ -67,6 +67,10 @@ const turnLoaded = new Map<string, Set<string>>()
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function isLoadToolName(name: string): boolean {
+  return name === "load_tool" || name.endsWith("_load_tool")
+}
+
 /**
  * Extract a brief one-line summary from a full tool description.
  * Takes the first sentence or first line (whichever is shorter),
@@ -90,7 +94,7 @@ function briefOf(description: string): string {
 function buildPointerList(): string {
   const pointers: string[] = []
   for (const [name, desc] of originals) {
-    if (name === "load_tool") continue
+    if (isLoadToolName(name)) continue
     const brief = briefOf(desc)
     pointers.push(brief ? `- ${name} - ${brief}` : `- ${name}`)
   }
@@ -164,6 +168,7 @@ function wrapFetch(): void {
     if (!sessionID) {
       sessionID = `__req_${Date.now()}_${Math.random().toString(36).slice(2)}__`
     }
+    let loadToolName = "load_tool"
 
     // ── Request-side: remove ALL tools except load_tool ──
     // The LLM only sees load_tool. Pointers go into load_tool's description.
@@ -178,11 +183,19 @@ function wrapFetch(): void {
         try {
           const body = JSON.parse(bodyText)
           if (Array.isArray(body.tools)) {
+            const gateway = body.tools.find((t: any) => {
+              const name = t?.function?.name || t?.name || ""
+              return isLoadToolName(name)
+            })
+            if (gateway) {
+              loadToolName = gateway.function?.name || gateway.name
+            }
+
             // Save MCP tools (not in originals) before removing them
             for (const t of body.tools) {
               const fn = t?.function
               const name = fn?.name || t?.name || ""
-              if (!name || name === "load_tool") continue
+              if (!name || isLoadToolName(name)) continue
               if (originals.has(name)) {
                 // Built-in tool: capture its JSON schema here (jsonSchema is
                 // undefined in the tool.definition hook — it's only generated
@@ -205,7 +218,7 @@ function wrapFetch(): void {
             // Keep ONLY load_tool in the tools array
             body.tools = body.tools.filter((t: any) => {
               const name = t?.function?.name || t?.name || ""
-              return name === "load_tool"
+              return isLoadToolName(name)
             })
 
             // STRIP prior load_tool calls AND their results from the messages
@@ -234,7 +247,7 @@ function wrapFetch(): void {
                 for (const m of priorMessages) {
                   if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
                     for (const tc of m.tool_calls) {
-                      if (tc?.function?.name === "load_tool" && tc?.id) {
+                      if (isLoadToolName(tc?.function?.name || "") && tc?.id) {
                         loadToolCallIds.add(tc.id)
                       }
                     }
@@ -247,7 +260,7 @@ function wrapFetch(): void {
                     continue
                   }
                   if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
-                    m.tool_calls = m.tool_calls.filter((tc: any) => tc?.function?.name !== "load_tool")
+                    m.tool_calls = m.tool_calls.filter((tc: any) => !isLoadToolName(tc?.function?.name || ""))
                     if (m.tool_calls.length === 0) {
                       // Delete the empty tool_calls array — some providers (DeepSeek)
                       // reject "tool_calls: []" with "Expected an array with minimum length 1"
@@ -277,7 +290,7 @@ function wrapFetch(): void {
             if (pointerList) {
               for (const t of body.tools) {
                 const fn = t?.function
-                if (fn && fn.name === "load_tool") {
+                if (fn && isLoadToolName(fn.name)) {
                   fn.description = [
                     "Gateway tool — the only tool you can call directly.",
                     "All other tools are accessed through this tool.",
@@ -307,7 +320,7 @@ function wrapFetch(): void {
     const contentType = response.headers.get("content-type") || ""
     if (!contentType.includes("text/event-stream") || !response.body) return response
 
-    const transformed = response.body.pipeThrough(createSSETransform(sessionID))
+    const transformed = response.body.pipeThrough(createSSETransform(sessionID, loadToolName))
     return new Response(transformed, {
       status: response.status,
       statusText: response.statusText,
@@ -335,7 +348,7 @@ function wrapFetch(): void {
  *   - Line 826: subsequent chunks APPEND to toolCalls[index].function.arguments
  *   - Line 833: when accumulated args become parseable JSON, emits tool-call
  */
-function createSSETransform(sessionID: string): TransformStream<Uint8Array, Uint8Array> {
+function createSSETransform(sessionID: string, loadToolName: string): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ""
@@ -408,7 +421,7 @@ function createSSETransform(sessionID: string): TransformStream<Uint8Array, Uint
                 const callArgs = JSON.parse(buf.arguments)
                 toolBuffers.delete(idx)
 
-                if (name === "load_tool") {
+                if (isLoadToolName(name)) {
                   // load_tool passes through. Track the loaded tool in this
                   // stream so subsequent direct calls within the SAME turn work.
                   const loadName = callArgs.name
@@ -418,7 +431,7 @@ function createSSETransform(sessionID: string): TransformStream<Uint8Array, Uint
                     id: buf.id,
                     type: "function",
                     function: {
-                      name: "load_tool",
+                      name: loadToolName,
                       arguments: buf.arguments,
                     },
                   })
@@ -452,7 +465,7 @@ function createSSETransform(sessionID: string): TransformStream<Uint8Array, Uint
                         id: buf.id,
                         type: "function",
                         function: {
-                          name: "load_tool",
+                          name: loadToolName,
                           arguments: JSON.stringify({ name }),
                         },
                       })
@@ -505,7 +518,7 @@ function createSSETransform(sessionID: string): TransformStream<Uint8Array, Uint
       // Emit any remaining buffered tool calls (incomplete arguments).
       // Pass through as-is using whatever name was captured.
       for (const [idx, buf] of toolBuffers) {
-        const name = buf.name || "load_tool"
+        const name = isLoadToolName(buf.name || "") ? loadToolName : buf.name || loadToolName
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
           choices: [{ delta: { tool_calls: [{
             index: idx,
@@ -591,7 +604,7 @@ const LazyLoadPlugin: Plugin = async (_input, _options) => {
 
     async "tool.definition"(input, output) {
       // Never modify our own tool
-      if (input.toolID === "load_tool") return
+      if (isLoadToolName(input.toolID)) return
 
       if (!originals.has(input.toolID)) {
         originals.set(input.toolID, output.description)
