@@ -116,6 +116,55 @@ function isParsableJson(str: string): boolean {
   try { JSON.parse(str); return true } catch { return false }
 }
 
+const DSML_TOOL_CALLS_START = "<｜｜DSML｜｜tool_calls>"
+const DSML_TOOL_CALLS_END = "</｜｜DSML｜｜tool_calls>"
+
+function parseDSMLAttributes(segment: string | undefined): Record<string, string> | undefined {
+  const input = (segment || "").trim()
+  if (!input) return {}
+  if (!/^[^\s="]+\s*=\s*"[^"]*"(?:\s+[^\s="]+\s*=\s*"[^"]*")*$/.test(input)) return undefined
+
+  const attributes: Record<string, string> = Object.create(null)
+  for (const attribute of input.matchAll(/([^\s="]+)\s*=\s*"([^"]*)"/g)) {
+    if (Object.prototype.hasOwnProperty.call(attributes, attribute[1])) return undefined
+    attributes[attribute[1]] = attribute[2]
+  }
+  return attributes
+}
+
+function parseDSMLCalls(block: string): Array<{ name: string; arguments: string }> {
+  const calls: Array<{ name: string; arguments: string }> = []
+  const invokePattern = /<｜｜DSML｜｜invoke(?:\s+([^>]*?))?>([\s\S]*?)<\/｜｜DSML｜｜invoke>/g
+  const parameterPattern = /<｜｜DSML｜｜parameter(?:\s+([^>]*?))?>([\s\S]*?)<\/｜｜DSML｜｜parameter>/g
+  const inner = block.slice(DSML_TOOL_CALLS_START.length, -DSML_TOOL_CALLS_END.length)
+  const invokes = Array.from(inner.matchAll(invokePattern))
+  let invokeEnd = 0
+
+  for (const invoke of invokes) {
+    if (inner.slice(invokeEnd, invoke.index).trim()) return []
+    invokeEnd = invoke.index + invoke[0].length
+    const name = parseDSMLAttributes(invoke[1])?.name
+    if (!name) return []
+
+    const args: Record<string, string> = Object.create(null)
+    const parameters = Array.from(invoke[2].matchAll(parameterPattern))
+    let parameterEnd = 0
+    for (const parameter of parameters) {
+      if (invoke[2].slice(parameterEnd, parameter.index).trim()) return []
+      parameterEnd = parameter.index + parameter[0].length
+      const parameterName = parseDSMLAttributes(parameter[1])?.name
+      if (!parameterName) return []
+      if (Object.prototype.hasOwnProperty.call(args, parameterName)) return []
+      args[parameterName] = parameter[2]
+    }
+    if (invoke[2].slice(parameterEnd).trim()) return []
+    calls.push({ name, arguments: JSON.stringify(args) })
+  }
+
+  if (inner.slice(invokeEnd).trim()) return []
+  return calls
+}
+
 type KnownTool = { name: string; kind: "built-in" | "mcp" }
 
 function resolveKnownTool(name: string): KnownTool | undefined {
@@ -437,8 +486,23 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ""
-  // Per-index buffer for ALL tool calls: {id, name, arguments}
-  const toolBuffers = new Map<number, { id?: string; name?: string; arguments: string }>()
+  // Native fragments stay keyed by their upstream index until emission.
+  const toolBuffers = new Map<number, {
+    id?: string
+    name?: string
+    arguments: string
+    hasFunction: boolean
+  }>()
+  const nativeToolIndexes = new Map<number, number>()
+  const nativeSourceIndex = Symbol("nativeSourceIndex")
+  const nativeRewrite = Symbol("nativeRewrite")
+  type TextField = "content" | "reasoning_content"
+  type TextFragment = { field: TextField; text: string; parsed: any }
+  let textField: TextField | undefined
+  let textBuffer = ""
+  let textFragments: TextFragment[] = []
+  let nextEmittedToolIndex = 0
+  let hasPendingDSMLCall = false
   // Get or create this session's turn-loaded set. Persists across multiple
   // fetch calls within ONE turn (one user message). Cleared when finish_reason
   // "stop" is seen in the SSE stream — that's the LLM's end-of-turn signal.
@@ -447,6 +511,247 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
   function getTurnLoaded(): Set<string> {
     if (!turnLoaded.has(sessionID)) turnLoaded.set(sessionID, new Set())
     return turnLoaded.get(sessionID)!
+  }
+
+  function toolCall(index: number, id: string | undefined, name: string, argumentsJson: string): any {
+    return {
+      index,
+      id,
+      type: "function",
+      function: { name, arguments: argumentsJson },
+    }
+  }
+
+  function allocateToolIndex(): number {
+    return nextEmittedToolIndex++
+  }
+
+  function nativeToolIndex(sourceIndex: unknown): number {
+    if (typeof sourceIndex !== "number") return allocateToolIndex()
+    let emittedIndex = nativeToolIndexes.get(sourceIndex)
+    if (emittedIndex === undefined) {
+      emittedIndex = allocateToolIndex()
+      nativeToolIndexes.set(sourceIndex, emittedIndex)
+    }
+    return emittedIndex
+  }
+
+  function markNativeCall(
+    call: any,
+    sourceIndex: unknown,
+    rewrite?: { id?: string; name: string; arguments: string },
+  ): any {
+    Object.defineProperty(call, nativeSourceIndex, { value: sourceIndex })
+    if (rewrite) Object.defineProperty(call, nativeRewrite, { value: rewrite })
+    return call
+  }
+
+  function rewriteCompletedCall(index: number, id: string | undefined, name: string, argumentsJson: string): any {
+    const callArgs = JSON.parse(argumentsJson)
+
+    if (isLoadToolName(name)) {
+      const requestedName = typeof callArgs?.name === "string" ? callArgs.name : ""
+      const resolvedName = resolveKnownTool(requestedName)?.name || requestedName
+      if (resolvedName) getTurnLoaded().add(resolvedName)
+      return toolCall(
+        index,
+        id,
+        loadToolName,
+        resolvedName !== requestedName
+          ? JSON.stringify({ ...callArgs, name: resolvedName })
+          : argumentsJson,
+      )
+    }
+
+    const knownTool = resolveKnownTool(name)
+    if (knownTool?.kind === "built-in") {
+      if (getTurnLoaded().has(knownTool.name)) {
+        return toolCall(
+          index,
+          id,
+          knownTool.name,
+          normalizeToolArguments(argumentsJson, originalSchemas.get(knownTool.name)),
+        )
+      }
+
+      getTurnLoaded().add(knownTool.name)
+      return toolCall(index, id, loadToolName, JSON.stringify({ name: knownTool.name }))
+    }
+
+    const mcpName = knownTool?.kind === "mcp" ? knownTool.name : undefined
+    return toolCall(
+      index,
+      id,
+      mcpName || name,
+      mcpName ? normalizeToolArguments(argumentsJson, mcpSchemas.get(mcpName)) : argumentsJson,
+    )
+  }
+
+  function enqueueParsed(controller: TransformStreamDefaultController<Uint8Array>, parsed: any): void {
+    const calls = parsed?.choices?.[0]?.delta?.tool_calls
+    if (Array.isArray(calls)) {
+      for (let index = 0; index < calls.length; index++) {
+        const call = calls[index]
+        if (call && typeof call === "object" && nativeSourceIndex in call) {
+          const emittedIndex = nativeToolIndex(call[nativeSourceIndex])
+          const rewrite = call[nativeRewrite]
+          if (rewrite) {
+            calls[index] = rewriteCompletedCall(
+              emittedIndex,
+              rewrite.id,
+              rewrite.name,
+              rewrite.arguments,
+            )
+          } else {
+            call.index = emittedIndex
+          }
+        }
+      }
+    }
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`))
+  }
+
+  function minimalTextEvent(): any {
+    return { choices: [{ delta: {} }] }
+  }
+
+  function enqueueWithoutText(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    parsed: any,
+    field: TextField,
+  ): void {
+    const choice = parsed?.choices?.[0]
+    const delta = choice?.delta
+    if (delta) delete delta[field]
+    const hasData = Object.keys(parsed || {}).some((key) => key !== "choices")
+      || (Array.isArray(parsed?.choices) && parsed.choices.length > 1)
+      || Object.keys(choice || {}).some((key) => key !== "delta")
+      || Object.keys(delta || {}).length > 0
+    if (hasData) enqueueParsed(controller, parsed)
+  }
+
+  function emitBufferedText(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    length: number,
+  ): void {
+    textBuffer = textBuffer.slice(length)
+    while (length > 0) {
+      const fragment = textFragments[0]
+      const consumed = Math.min(length, fragment.text.length)
+      const parsed = fragment.parsed
+      parsed.choices[0].delta[fragment.field] = fragment.text.slice(0, consumed)
+      enqueueParsed(controller, parsed)
+
+      fragment.text = fragment.text.slice(consumed)
+      fragment.parsed = minimalTextEvent()
+      length -= consumed
+      if (!fragment.text) textFragments.shift()
+    }
+    if (!textBuffer) textField = undefined
+  }
+
+  function replaceBufferedText(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    length: number,
+    calls: any[],
+  ): void {
+    const field = textField!
+    const extraEnvelopes: any[] = []
+    let callEnvelope: any
+    textBuffer = textBuffer.slice(length)
+
+    while (length > 0) {
+      const fragment = textFragments[0]
+      const consumed = Math.min(length, fragment.text.length)
+      if (!callEnvelope) callEnvelope = fragment.parsed
+      else extraEnvelopes.push(fragment.parsed)
+
+      fragment.text = fragment.text.slice(consumed)
+      fragment.parsed = minimalTextEvent()
+      length -= consumed
+      if (!fragment.text) textFragments.shift()
+    }
+
+    const delta = callEnvelope.choices[0].delta
+    delete delta[field]
+    delta.tool_calls = [...calls, ...(Array.isArray(delta.tool_calls) ? delta.tool_calls : [])]
+    enqueueParsed(controller, callEnvelope)
+    for (const parsed of extraEnvelopes) enqueueWithoutText(controller, parsed, field)
+    if (!textBuffer) textField = undefined
+  }
+
+  function possibleStartSuffixLength(text: string): number {
+    for (let length = Math.min(text.length, DSML_TOOL_CALLS_START.length - 1); length > 0; length--) {
+      if (DSML_TOOL_CALLS_START.startsWith(text.slice(-length))) return length
+    }
+    return 0
+  }
+
+  function processBufferedText(controller: TransformStreamDefaultController<Uint8Array>): number {
+    let convertedCalls = 0
+    while (textBuffer) {
+      const start = textBuffer.indexOf(DSML_TOOL_CALLS_START)
+      if (start < 0) {
+        emitBufferedText(controller, textBuffer.length - possibleStartSuffixLength(textBuffer))
+        return convertedCalls
+      }
+      if (start > 0) {
+        emitBufferedText(controller, start)
+        continue
+      }
+
+      const end = textBuffer.indexOf(DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_START.length)
+      if (end < 0) return convertedCalls
+      const blockLength = end + DSML_TOOL_CALLS_END.length
+      const parsedCalls = parseDSMLCalls(textBuffer.slice(0, blockLength))
+      if (parsedCalls.length === 0) {
+        emitBufferedText(controller, blockLength)
+        continue
+      }
+
+      const calls = parsedCalls.map((call) => rewriteCompletedCall(
+        allocateToolIndex(),
+        `call_${globalThis.crypto.randomUUID().replace(/-/g, "")}`,
+        call.name,
+        call.arguments,
+      ))
+      convertedCalls += calls.length
+      replaceBufferedText(controller, blockLength, calls)
+    }
+    return convertedCalls
+  }
+
+  function appendText(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    parsed: any,
+    field: TextField,
+    text: string,
+  ): number {
+    if (textField && textField !== field) emitBufferedText(controller, textBuffer.length)
+    textField = field
+    textBuffer += text
+    textFragments.push({ field, text, parsed })
+    return processBufferedText(controller)
+  }
+
+  function flushBufferedText(controller: TransformStreamDefaultController<Uint8Array>): void {
+    if (textBuffer) emitBufferedText(controller, textBuffer.length)
+  }
+
+  function flushToolBuffers(controller: TransformStreamDefaultController<Uint8Array>): void {
+    for (const [sourceIndex, buf] of toolBuffers) {
+      if (!buf.hasFunction) continue
+      const name = isLoadToolName(buf.name || "") ? loadToolName : buf.name || loadToolName
+      enqueueParsed(controller, {
+        choices: [{ delta: { tool_calls: [toolCall(
+          sourceIndex,
+          buf.id,
+          name,
+          buf.arguments,
+        )].map((call) => markNativeCall(call, sourceIndex)) } }],
+      })
+    }
+    toolBuffers.clear()
   }
 
   return new TransformStream<Uint8Array, Uint8Array>({
@@ -462,23 +767,50 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
           if (!line.startsWith("data:")) continue
           const data = line.startsWith("data: ") ? line.slice(6) : line.slice(5)
           if (data === "[DONE]") {
+            flushBufferedText(controller)
+            flushToolBuffers(controller)
             controller.enqueue(encoder.encode("data: [DONE]\n\n"))
             continue
           }
 
+          let resetTurnOnStop = false
           try {
             const parsed = JSON.parse(data)
             const toolCalls = parsed?.choices?.[0]?.delta?.tool_calls
+            const finishReason = parsed?.choices?.[0]?.finish_reason
+            resetTurnOnStop = finishReason === "stop"
+            const finishEvent = finishReason != null
+              ? JSON.parse(JSON.stringify(parsed))
+              : undefined
+            if (finishEvent) parsed.choices[0].finish_reason = null
+            const incomingDelta = parsed?.choices?.[0]?.delta
+            const hasIncomingText = (["content", "reasoning_content"] as TextField[])
+              .some((field) => typeof incomingDelta?.[field] === "string" && incomingDelta[field].length > 0)
+
+            if ((Array.isArray(toolCalls) || finishReason != null) && !hasIncomingText) {
+              flushBufferedText(controller)
+            }
+            let shouldEmit = true
 
             if (Array.isArray(toolCalls)) {
               const filtered: any[] = []
 
               for (const tc of toolCalls) {
-                if (!tc || !tc.function) {
+                if (!tc || typeof tc !== "object") {
                   filtered.push(tc)
                   continue
                 }
                 const idx = tc.index
+
+                if (!tc.function) {
+                  if (typeof idx === "number") {
+                    const buf = toolBuffers.get(idx) || { arguments: "", hasFunction: false }
+                    if (tc.id) buf.id = tc.id
+                    toolBuffers.set(idx, buf)
+                  }
+                  filtered.push(markNativeCall({ ...tc }, idx))
+                  continue
+                }
 
                 // First chunk for this index has the tool name; subsequent
                 // chunks only append arguments.
@@ -487,12 +819,14 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
                     id: tc.id,
                     name: tc.function.name,
                     arguments: tc.function.arguments || "",
+                    hasFunction: true,
                   })
                 } else {
                   const buf = toolBuffers.get(idx)!
                   if (tc.id) buf.id = tc.id
                   if (tc.function.name) buf.name = tc.function.name
                   buf.arguments += tc.function.arguments || ""
+                  buf.hasFunction = true
                 }
 
                 const buf = toolBuffers.get(idx)!
@@ -503,125 +837,73 @@ function createSSETransform(sessionID: string, loadToolName: string): TransformS
 
                 // Arguments complete — process by name
                 const name = buf.name || ""
-                const callArgs = JSON.parse(buf.arguments)
                 toolBuffers.delete(idx)
-
-                if (isLoadToolName(name)) {
-                  // load_tool passes through. Track the loaded tool in this
-                  // stream so subsequent direct calls within the SAME turn work.
-                  const requestedName = typeof callArgs?.name === "string" ? callArgs.name : ""
-                  const loadName = resolveKnownTool(requestedName)?.name || requestedName
-                  if (loadName) getTurnLoaded().add(loadName)
-                  filtered.push({
-                    index: idx,
-                    id: buf.id,
-                    type: "function",
-                    function: {
-                      name: loadToolName,
-                      arguments: loadName !== requestedName
-                        ? JSON.stringify({ ...callArgs, name: loadName })
-                        : buf.arguments,
-                    },
-                  })
-                } else {
-                  // Direct call to a built-in tool.
-                  // If loaded earlier in THIS stream (same turn), allow it.
-                  // Otherwise rewrite to load_tool. turnLoaded persists across
-                  // fetches within the same turn (multi-step tool use) and is
-                  // cleared when finish_reason "stop" is seen.
-                  // MCP tools (no entry in originals) remain direct calls.
-                  const knownTool = resolveKnownTool(name)
-                  if (knownTool?.kind === "built-in") {
-                    const originalName = knownTool.name
-                    if (getTurnLoaded().has(originalName)) {
-                      // Already loaded in this turn — allow direct call
-                      filtered.push({
-                        index: idx,
-                        id: buf.id,
-                        type: "function",
-                        function: {
-                          name: originalName,
-                          arguments: normalizeToolArguments(buf.arguments, originalSchemas.get(originalName)),
-                        },
-                      })
-                    } else {
-                      // Not loaded yet — rewrite to load_tool.
-                      // ALSO add to turnLoaded now, because the load_tool will
-                      // execute and return the tool's instructions. The LLM's
-                      // next call to this tool should be allowed directly.
-                      getTurnLoaded().add(originalName)
-                      filtered.push({
-                        index: idx,
-                        id: buf.id,
-                        type: "function",
-                        function: {
-                          name: loadToolName,
-                          arguments: JSON.stringify({ name: originalName }),
-                        },
-                      })
-                    }
-                  } else {
-                    // Known MCP tools pass through directly with their own schema.
-                    // Unknown tools remain byte-for-byte unchanged.
-                    const mcpName = knownTool?.kind === "mcp" ? knownTool.name : undefined
-                    filtered.push({
-                      index: idx,
-                      id: buf.id,
-                      type: "function",
-                      function: {
-                        name: mcpName || name,
-                        arguments: mcpName
-                          ? normalizeToolArguments(buf.arguments, mcpSchemas.get(mcpName))
-                          : buf.arguments,
-                      },
-                    })
-                  }
-                }
+                filtered.push(markNativeCall(
+                  toolCall(0, buf.id, name, buf.arguments),
+                  idx,
+                  { id: buf.id, name, arguments: buf.arguments },
+                ))
               }
 
               if (filtered.length > 0) {
                 parsed.choices[0].delta.tool_calls = filtered
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`))
               } else {
                 // All tool_calls are buffered — emit chunk without tool_calls
                 // (but keep text/finish_reason if present)
                 delete parsed.choices[0].delta.tool_calls
                 const delta = parsed.choices[0].delta
-                if (delta.content || delta.reasoning || parsed.choices[0].finish_reason) {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`))
+                shouldEmit = Boolean(delta.content || delta.reasoning || delta.reasoning_content)
+              }
+            }
+
+            const delta = parsed?.choices?.[0]?.delta
+            const fields = (["content", "reasoning_content"] as TextField[])
+              .filter((field) => typeof delta?.[field] === "string" && delta[field].length > 0)
+            let convertedDSMLCalls = 0
+            if (shouldEmit && fields.length > 0) {
+              const values = fields.map((field) => delta[field] as string)
+              for (let index = 0; index < fields.length; index++) {
+                const field = fields[index]
+                const textEvent = index === 0 ? parsed : minimalTextEvent()
+                if (index === 0) {
+                  for (const otherField of fields.slice(1)) delete textEvent.choices[0].delta[otherField]
                 }
+                textEvent.choices[0].delta[field] = values[index]
+                convertedDSMLCalls += appendText(controller, textEvent, field, values[index])
               }
-            } else {
-              // No tool_calls in this chunk — pass through
-              // Check for finish_reason "stop" — that's the LLM's end-of-turn
-              // signal. Clear turnLoaded so the next turn starts fresh.
-              const fr = parsed?.choices?.[0]?.finish_reason
-              if (fr === "stop") {
-                turnLoaded.delete(sessionID)
+            } else if (shouldEmit && (!finishEvent || Array.isArray(delta?.tool_calls))) {
+              enqueueParsed(controller, parsed)
+            }
+            if (convertedDSMLCalls > 0) hasPendingDSMLCall = true
+
+            if (finishEvent) {
+              flushBufferedText(controller)
+              flushToolBuffers(controller)
+              if (finishReason === "stop" && hasPendingDSMLCall) {
+                finishEvent.choices[0].finish_reason = "tool_calls"
+                resetTurnOnStop = false
               }
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`))
+              hasPendingDSMLCall = false
+              const finishDelta = finishEvent.choices[0].delta
+              if (finishDelta && typeof finishDelta === "object") {
+                delete finishDelta.content
+                delete finishDelta.reasoning_content
+                delete finishDelta.tool_calls
+              }
+              enqueueParsed(controller, finishEvent)
             }
           } catch {
             // Not valid JSON — pass through unchanged
+            flushBufferedText(controller)
             controller.enqueue(encoder.encode(`data: ${data}\n\n`))
           }
+          if (resetTurnOnStop) turnLoaded.delete(sessionID)
         }
       }
     },
     flush(controller) {
-      // Emit any remaining buffered tool calls (incomplete arguments).
-      // Pass through as-is using whatever name was captured.
-      for (const [idx, buf] of toolBuffers) {
-        const name = isLoadToolName(buf.name || "") ? loadToolName : buf.name || loadToolName
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-          choices: [{ delta: { tool_calls: [{
-            index: idx,
-            id: buf.id,
-            type: "function",
-            function: { name, arguments: buf.arguments },
-          }] } }],
-        })}\n\n`))
-      }
+      flushBufferedText(controller)
+      flushToolBuffers(controller)
       if (buffer) {
         controller.enqueue(encoder.encode(buffer))
       }
